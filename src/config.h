@@ -1,9 +1,10 @@
 // config.h — compile-time constants for smalltv-mod
 //
-// Hardware: three board variants, all a 1.54" 240x240 ST7789 IPS panel:
+// Hardware: four board variants, all a 1.54" 240x240 ST7789 IPS panel:
 //   - Original GeekMagic SmallTV: ESP-12F (ESP8266)      [board_esp8266.h]
 //   - Knockoff SmallTV:           ESP32-C2 / ESP8684      [board_esp32c2.h]
 //   - NMMiner NM-TV-154:          classic ESP32 (WROOM-32E) [board_esp32.h]
+//   - GeekMagic SmallTV Pro:      classic ESP32, 8 MB flash [board_esp32_pro.h]
 // The board-specific pin map + panel quirks live in the board headers, selected
 // below by the build-time target macro. Everything else here is shared.
 #pragma once
