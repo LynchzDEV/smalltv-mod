@@ -93,7 +93,7 @@ void gfxSetRotation(uint8_t r) {
 }
 
 // ---- text helpers (built-in 6x8 font, integer scaled) ---------------------
-int gfxTextW(const char* s, uint8_t size) { return (int)strlen(s) * 6 * size; }
+int gfxTextW(const char* s, uint8_t size) { return (int)strlen(s) * GFX_FONT_W * size; }
 
 void gfxDrawCentered(const char* s, int y, uint8_t size, uint16_t color) {
   if (!gfx) return;
