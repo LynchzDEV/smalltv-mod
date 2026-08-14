@@ -48,6 +48,7 @@ export default defineConfig({
           items: [
             { label: 'Stock and crypto ticker', link: '/features/ticker/' },
             { label: 'Claude usage meter', link: '/features/usage/' },
+            { label: 'Claude session alerts', link: '/features/alerts/' },
             { label: 'Plane radar', link: '/features/radar/' },
           ],
         },

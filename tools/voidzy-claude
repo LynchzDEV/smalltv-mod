@@ -1,0 +1,823 @@
+#!/usr/bin/env python3
+"""Alert the smalltv-mod desk clock when a Claude Code session finishes or needs an answer.
+
+Reads Claude Code hook events, keeps per-session state in ~/.voidzy/state.json, and POSTs
+/api/notify so the clock takes its whole screen for a mascot, then reverts on its own.
+
+  voidzy-claude --install [--dry-run]   wire into ~/.claude/settings.json
+  voidzy-claude --uninstall             remove only what --install added
+  voidzy-claude --hook [--dry-run]      consume one hook event on stdin
+  voidzy-claude --status                what is tracked, and what the clock was last told
+  voidzy-claude --send-now [--dry-run]  notify now, ignoring the edge trigger
+  voidzy-claude selftest                assert per-session triggering holds, clock untouched
+  voidzy-claude help
+
+Each session is alerted on its own: one finishing while another still works is announced,
+and the same state is never announced twice for the same session. Sessions that transition
+together inside the debounce window are folded into one alert labelled "project +N".
+
+Env: VOIDZY (default 192.168.1.80), VOIDZY_FALLBACK (default smalltv-36f5.local),
+     VOIDZY_HOME (default ~/.voidzy), VOIDZY_TTL (default 20), VOIDZY_DEBOUNCE (default 1),
+     VOIDZY_IGNORE (default observer-sessions) comma-separated project names that never
+       take the screen, for background sessions you cannot answer anyway,
+     VOIDZY_COOLDOWN (default 60) seconds before one session may raise "waiting" again,
+       so a repeating Notification alerts once instead of re-arming the overlay forever,
+     VOIDZY_MIN_WORK (default 30) seconds a session must have been working before its
+       Stop counts as finished work — Stop fires at the end of every assistant turn, so
+       without this an ordinary chat reply takes the whole screen,
+     VOIDZY_DONE_COOLDOWN (default 120) seconds before one session may raise "done"
+       again, so a conversation cannot celebrate turn after turn
+"""
+
+import contextlib
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+import traceback
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+SELF = Path(__file__).resolve()
+SETTINGS = Path.home() / ".claude" / "settings.json"
+
+HOST = os.environ.get("VOIDZY", "192.168.1.80")
+FALLBACK = os.environ.get("VOIDZY_FALLBACK", "smalltv-36f5.local")
+TTL = int(os.environ.get("VOIDZY_TTL", "20"))
+DEBOUNCE = float(os.environ.get("VOIDZY_DEBOUNCE", "1"))
+COOLDOWN = {"waiting": float(os.environ.get("VOIDZY_COOLDOWN", "60")),
+            "done": float(os.environ.get("VOIDZY_DONE_COOLDOWN", "120"))}
+MIN_WORK = float(os.environ.get("VOIDZY_MIN_WORK", "30"))
+IGNORE = {p.strip().lower()
+          for p in os.environ.get("VOIDZY_IGNORE", "observer-sessions").split(",") if p.strip()}
+HTTP_TIMEOUT = 1.5
+EVICT = 3600
+STATE_LOCK_STALE = 10
+SEND_LOCK_STALE = 30
+LOG_MAX = 262144
+LABEL_MAX = 20
+
+EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
+          "Notification", "Stop", "SessionEnd"]
+
+ALERT = {"waiting": "waiting", "done": "done"}
+RANK = {"done": 0, "waiting": 1}
+
+HOME = STATE = STATE_LOCK = SEND_LOCK = LOGFILE = None
+
+
+def set_home(path):
+    global HOME, STATE, STATE_LOCK, SEND_LOCK, LOGFILE
+    HOME = Path(path)
+    STATE = HOME / "state.json"
+    STATE_LOCK = HOME / "state.lock"
+    SEND_LOCK = HOME / "send.lock"
+    LOGFILE = HOME / "log"
+
+
+set_home(os.environ.get("VOIDZY_HOME") or Path.home() / ".voidzy")
+
+
+def log(message):
+    try:
+        HOME.mkdir(parents=True, exist_ok=True)
+        if LOGFILE.exists() and LOGFILE.stat().st_size > LOG_MAX:
+            tail = LOGFILE.read_text(errors="replace").splitlines()[-200:]
+            LOGFILE.write_text("\n".join(tail) + "\n")
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with LOGFILE.open("a") as fh:
+            fh.write("%s  %s\n" % (stamp, message))
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def lockfile(path, stale):
+    held = False
+    try:
+        HOME.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    for _ in range(50):
+        try:
+            os.close(os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+            held = True
+            break
+        except FileExistsError:
+            try:
+                if time.time() - path.stat().st_mtime > stale:
+                    path.unlink()
+                    continue
+            except OSError:
+                continue
+            time.sleep(0.05)
+        except OSError:
+            break
+    try:
+        yield held
+    finally:
+        if held:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def read_state():
+    try:
+        state = json.loads(STATE.read_text())
+    except Exception:
+        state = {}
+    if not isinstance(state, dict):
+        state = {}
+    if not isinstance(state.get("sessions"), dict):
+        state["sessions"] = {}
+    return state
+
+
+def write_state(state):
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+    tmp.replace(STATE)
+
+
+def apply_event(state, event, now):
+    name = event.get("hook_event_name") or ""
+    session_id = event.get("session_id") or "unknown"
+    state["last_event_at"] = now
+
+    if name == "SessionEnd":
+        state["sessions"].pop(session_id, None)
+        return
+
+    session = state["sessions"].get(session_id)
+    if not isinstance(session, dict):
+        session = {"act": "idle"}
+    cwd = event.get("cwd") or ""
+    if cwd:
+        session["project"] = os.path.basename(cwd.rstrip("/")) or "claude"
+    session["at"] = now
+
+    if name == "SessionStart":
+        session["act"] = "idle"
+    elif name in ("UserPromptSubmit", "PreToolUse", "PostToolUse"):
+        if session["act"] != "working":
+            session["work_since"] = now
+        session["act"] = "working"
+    elif name == "Notification":
+        session["act"] = "waiting"
+    elif name == "Stop":
+        session["act"] = "done"
+
+    if ALERT.get(session.get("act")) is None:
+        session.pop("alerted", None)
+        session.pop("alerted_at", None)
+
+    state["sessions"][session_id] = session
+
+
+def ignored(project):
+    return (project or "").strip().lower() in IGNORE
+
+
+def pending(state, now):
+    items = []
+    for session_id, session in state["sessions"].items():
+        if not isinstance(session, dict):
+            continue
+        if now - float(session.get("at") or 0) >= EVICT:
+            continue
+        alert = ALERT.get(session.get("act"))
+        if alert is None or ignored(session.get("project")):
+            continue
+        if session.get("alerted") == alert:
+            continue
+        if alert == "done" and now - float(session.get("work_since") or 0) < MIN_WORK:
+            continue
+        if now - float(session.get(alert + "_at") or 0) < COOLDOWN[alert]:
+            continue
+        items.append((session_id, session, alert))
+    items.sort(key=lambda item: (RANK[item[2]], float(item[1].get("at") or 0)), reverse=True)
+    return items
+
+
+def label_for(project, folded):
+    name = (project or "").strip() or "claude"
+    suffix = " +%d" % folded if folded else ""
+    return name[:LABEL_MAX - len(suffix)] + suffix
+
+
+def choose(items):
+    _session_id, session, alert = items[0]
+    return alert, label_for(session.get("project"), len(items) - 1)
+
+
+def mark_alerted(state, items, now):
+    for session_id, _snapshot, alert in items:
+        session = state["sessions"].get(session_id)
+        if not isinstance(session, dict):
+            continue
+        session[alert + "_at"] = now
+        if ALERT.get(session.get("act")) == alert:
+            session["alerted"] = alert
+            session["alerted_at"] = now
+
+
+def endpoints():
+    seen = [h for h in (HOST, FALLBACK) if h]
+    return list(dict.fromkeys("http://%s/api/notify" % h for h in seen))
+
+
+def body_for(alert, label):
+    return json.dumps({"state": alert, "ttl": TTL, "label": label})
+
+
+def notify(alert, label):
+    body = body_for(alert, label).encode()
+    problem = "no endpoint configured"
+    for url in endpoints():
+        request = urllib.request.Request(
+            url, data=body, method="POST", headers={"Content-Type": "application/json"})
+        try:
+            urllib.request.urlopen(request, timeout=HTTP_TIMEOUT).close()
+            return True, url
+        except Exception as exc:
+            problem = "%s — %s" % (url, exc)
+    return False, problem
+
+
+def deliver(alert, label):
+    ok, where = notify(alert, label)
+    log("notify %s %s %s" % (alert, label, where if ok else "FAILED %s" % where))
+    return 0 if ok else 1
+
+
+def pusher_running():
+    try:
+        return time.time() - SEND_LOCK.stat().st_mtime < SEND_LOCK_STALE
+    except OSError:
+        return False
+
+
+def spawn_push():
+    with open(os.devnull, "wb") as null:
+        subprocess.Popen(
+            [sys.executable, str(SELF), "--push"],
+            stdin=subprocess.DEVNULL, stdout=null, stderr=null, start_new_session=True)
+
+
+def push():
+    leftover = False
+    with lockfile(SEND_LOCK, SEND_LOCK_STALE) as held:
+        if not held:
+            log("skip — a notify is already in flight")
+            return 1
+
+        time.sleep(DEBOUNCE)
+        with lockfile(STATE_LOCK, STATE_LOCK_STALE):
+            items = pending(read_state(), time.time())
+        if not items:
+            log("nothing sent — nothing to announce")
+            return 0
+
+        alert, label = choose(items)
+        if deliver(alert, label) != 0:
+            return 1
+
+        with lockfile(STATE_LOCK, STATE_LOCK_STALE):
+            now = time.time()
+            state = read_state()
+            mark_alerted(state, items, now)
+            state["sent"], state["sent_label"], state["sent_at"] = alert, label, now
+            write_state(state)
+            leftover = bool(pending(state, now))
+
+    if leftover:
+        spawn_push()
+    return 0
+
+
+def hook_command():
+    return "%s --hook" % shlex.quote(str(SELF))
+
+
+def is_ours(entry):
+    return isinstance(entry, dict) and str(SELF) in str(entry.get("command", ""))
+
+
+def load_settings():
+    if not SETTINGS.exists():
+        return {}, ""
+    raw = SETTINGS.read_text()
+    if not raw.strip():
+        return {}, raw
+    settings = json.loads(raw)
+    if not isinstance(settings, dict):
+        raise SystemExit("voidzy-claude: %s is not a JSON object" % SETTINGS)
+    return settings, raw
+
+
+def save_settings(settings, raw):
+    if raw:
+        backup = SETTINGS.with_name(
+            "%s.voidzy-claude.%s.bak" % (SETTINGS.name, datetime.now().strftime("%Y%m%d-%H%M%S")))
+        backup.write_text(raw)
+        print("backup    %s" % backup)
+    SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS.write_text(json.dumps(settings, indent=2) + "\n")
+
+
+def cmd_install(dry):
+    settings, raw = load_settings()
+    command = hook_command()
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+    added = updated = kept = 0
+
+    for event in EVENTS:
+        entries = hooks.get(event)
+        if not isinstance(entries, list):
+            entries = []
+        mine = [inner for entry in entries if isinstance(entry, dict)
+                for inner in entry.get("hooks", []) if is_ours(inner)]
+        if mine:
+            for inner in mine:
+                if inner.get("command") == command:
+                    kept += 1
+                else:
+                    inner["command"] = command
+                    updated += 1
+        else:
+            entries.append({"hooks": [{"type": "command", "command": command}]})
+            added += 1
+        hooks[event] = entries
+
+    settings["hooks"] = hooks
+    print("events    %s" % " ".join(EVENTS))
+    print("command   %s" % command)
+    print("changes   %d added, %d repointed, %d already correct" % (added, updated, kept))
+    if dry:
+        print("dry run   %s not written" % SETTINGS)
+        return 0
+    save_settings(settings, raw)
+    print("wrote     %s" % SETTINGS)
+    return 0
+
+
+def cmd_uninstall(dry):
+    settings, raw = load_settings()
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        print("nothing to remove — %s has no hooks" % SETTINGS)
+        return 0
+    removed = 0
+
+    for event in list(hooks.keys()):
+        entries = hooks.get(event)
+        if not isinstance(entries, list):
+            continue
+        surviving = []
+        for entry in entries:
+            if not isinstance(entry, dict) or "hooks" not in entry:
+                surviving.append(entry)
+                continue
+            inner = [h for h in entry["hooks"] if not is_ours(h)]
+            removed += len(entry["hooks"]) - len(inner)
+            entry["hooks"] = inner
+            if inner:
+                surviving.append(entry)
+        if surviving:
+            hooks[event] = surviving
+        else:
+            del hooks[event]
+
+    if not hooks:
+        del settings["hooks"]
+    print("removed   %d hook entr%s" % (removed, "y" if removed == 1 else "ies"))
+    if dry:
+        print("dry run   %s not written" % SETTINGS)
+        return 0
+    if removed:
+        save_settings(settings, raw)
+        print("wrote     %s" % SETTINGS)
+    return 0
+
+
+def cmd_hook(dry):
+    event = json.loads(sys.stdin.read())
+    if not isinstance(event, dict):
+        raise ValueError("hook payload is not a JSON object")
+    now = time.time()
+    with lockfile(STATE_LOCK, STATE_LOCK_STALE):
+        state = read_state()
+        apply_event(state, event, now)
+        items = pending(state, now)
+        if not dry:
+            write_state(state)
+
+    if dry:
+        print("event     %s" % (event.get("hook_event_name") or "?"))
+        if not items:
+            print("alert     none")
+            print("notify    no — nothing to announce")
+            return
+        alert, label = choose(items)
+        print("alert     %s for %d session%s" % (alert, len(items), "" if len(items) == 1 else "s"))
+        print("notify    yes — POST %s %s" % (endpoints()[0], body_for(alert, label)))
+        return
+    if items and not pusher_running():
+        spawn_push()
+
+
+def cmd_status():
+    now = time.time()
+    state = read_state()
+    items = pending(state, now)
+    due = {session_id for session_id, _session, _alert in items}
+    live = {sid: s for sid, s in state["sessions"].items()
+            if isinstance(s, dict) and now - float(s.get("at") or 0) < EVICT}
+
+    print("voidzy-claude — %s, state %s" % (" then ".join(endpoints()), STATE))
+    print("ignoring  %s" % (", ".join(sorted(IGNORE)) or "nothing"))
+    print("sessions  %d" % len(live))
+    for sid, session in sorted(live.items(), key=lambda kv: -float(kv[1].get("at") or 0)):
+        if ignored(session.get("project")):
+            note = "ignored"
+        elif sid in due:
+            note = "DUE"
+        elif session.get("alerted"):
+            note = "%s announced" % session["alerted"]
+        else:
+            note = ""
+        print("  %-14s %-8s %4ds ago  %s  %s" % (
+            session.get("project") or "?", session.get("act") or "?",
+            now - float(session.get("at") or 0), sid[:8], note))
+    if state.get("sent"):
+        print("last sent %ds ago  %s %s" % (
+            now - float(state.get("sent_at") or 0), state["sent"], state.get("sent_label") or ""))
+    else:
+        print("last sent never")
+    if items:
+        alert, label = choose(items)
+        print("next      due now — %s" % body_for(alert, label))
+    else:
+        print("next      nothing to announce")
+    if pusher_running():
+        print("in flight yes — a notify is debouncing or posting")
+    return 0
+
+
+def cmd_send_now(dry):
+    items = pending(read_state(), time.time())
+    alert, label = choose(items) if items else ("done", label_for(None, 0))
+    if dry:
+        print("would POST %s %s" % (endpoints()[0], body_for(alert, label)))
+        return 0
+    log("send-now requested by hand")
+    return deliver(alert, label)
+
+
+def cmd_selftest():
+    import http.server
+    import tempfile
+    import threading
+
+    checks = []
+
+    def check(label, ok):
+        print("  %-58s %s" % (label, "ok" if ok else "FAIL"))
+        checks.append(bool(ok))
+
+    def event(name, session="s1", cwd="/tmp/voidzy"):
+        return {"hook_event_name": name, "session_id": session, "cwd": cwd}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        set_home(tmp)
+        now = 1_000_000.0
+        state = read_state()
+
+        check("an empty state announces nothing", pending(state, now) == [])
+
+        apply_event(state, event("SessionStart"), now)
+        check("a session that only started is idle, not waiting", pending(state, now) == [])
+
+        apply_event(state, event("UserPromptSubmit"), now + 1)
+        apply_event(state, event("PreToolUse"), now + 2)
+        check("a working session announces nothing", pending(state, now + 2) == [])
+
+        apply_event(state, event("Stop"), now + 100)
+        check("Stop becomes a due done", [i[2] for i in pending(state, now + 100)] == ["done"])
+
+        apply_event(state, event("PreToolUse", session="busy", cwd="/tmp/klangtech"), now + 101)
+        due = pending(state, now + 101)
+        check("a session finishing while another still works still alerts",
+              [i[0] for i in due] == ["s1"] and choose(due) == ("done", "voidzy"))
+
+        mark_alerted(state, due, now + 101)
+        check("  and once announced it does not announce again",
+              pending(state, now + 102) == [])
+
+        apply_event(state, event("Stop"), now + 103)
+        check("  a second Stop for the same session stays quiet", pending(state, now + 103) == [])
+
+        apply_event(state, event("UserPromptSubmit"), now + 300)
+        apply_event(state, event("Stop"), now + 400)
+        check("  answering it and finishing again is a fresh alert",
+              [i[0] for i in pending(state, now + 400)] == ["s1"])
+        mark_alerted(state, pending(state, now + 400), now + 400)
+
+        apply_event(state, event("UserPromptSubmit", session="chat"), now + 500)
+        apply_event(state, event("Stop", session="chat"), now + 502)
+        check("a two-second reply is a turn ending, not work finishing",
+              pending(state, now + 502) == [])
+
+        apply_event(state, event("UserPromptSubmit", session="chat"), now + 600)
+        for step in range(1, 9):
+            apply_event(state, event("PreToolUse", session="chat"), now + 600 + step * 5)
+        apply_event(state, event("Stop", session="chat"), now + 641)
+        check("a long task announces, and its tool calls never restarted the work clock",
+              [i[0] for i in pending(state, now + 641)] == ["chat"])
+
+        mark_alerted(state, pending(state, now + 641), now + 641)
+        apply_event(state, event("UserPromptSubmit", session="chat"), now + 700)
+        apply_event(state, event("Stop", session="chat"), now + 741)
+        check("a second long task inside the done cooldown does not re-arm",
+              pending(state, now + 741) == [])
+        check("  and after the done cooldown lapses it may alert again",
+              [i[0] for i in pending(state, now + 741 + COOLDOWN["done"])] == ["chat"])
+
+        apply_event(state, event("Notification", session="bg", cwd="/tmp/observer-sessions"),
+                    now + 900)
+        check("a Notification from an ignored project never takes the screen",
+              [i[0] for i in pending(state, now + 900)] == ["chat"])
+
+        apply_event(state, event("Notification", session="ask", cwd="/tmp/klangtech"), now + 910)
+        due = pending(state, now + 910)
+        check("waiting outranks another session's done and folds it in",
+              choose(due) == ("waiting", "klangtech +1") and len(due) == 2)
+
+        mark_alerted(state, due, now + 910)
+        apply_event(state, event("PostToolUse", session="ask", cwd="/tmp/klangtech"), now + 911)
+        apply_event(state, event("Notification", session="ask", cwd="/tmp/klangtech"), now + 912)
+        check("a Notification repeating inside the cooldown does not re-arm",
+              pending(state, now + 912) == [])
+        check("  and after the cooldown lapses it may alert again",
+              [i[0] for i in pending(state, now + 912 + COOLDOWN["waiting"])] == ["ask"])
+
+        apply_event(state, event("UserPromptSubmit", session="quick", cwd="/tmp/klangtech"),
+                    now + 980)
+        apply_event(state, event("Notification", session="quick", cwd="/tmp/klangtech"), now + 981)
+        check("a prompt nobody answered alerts at once — min work only guards done",
+              "quick" in [i[0] for i in pending(state, now + 981)])
+
+        apply_event(state, event("SessionEnd", session="ask"), now + 990)
+        check("SessionEnd forgets the session", "ask" not in state["sessions"])
+
+        check("a session older than the eviction window is ignored",
+              pending(state, now + EVICT + 1000) == [])
+
+        check("a folded label stays inside the clock's 20 characters",
+              label_for("a-very-long-project-name", 3) == "a-very-long-proje +3")
+
+        write_state(state)
+        restored = read_state()["sessions"]["s1"]
+        check("the state file round-trips, work clock included",
+              restored["project"] == "voidzy" and restored["work_since"] == now + 300)
+
+        STATE.write_text("{ this is not json")
+        check("a corrupt state file reads back empty instead of raising",
+              read_state() == {"sessions": {}})
+
+        check("the request body matches the firmware contract",
+              json.loads(body_for("waiting", "voidzy"))
+              == {"state": "waiting", "ttl": TTL, "label": "voidzy"})
+
+        posts = []
+
+        class Stub(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                posts.append((self.command, self.path, self.headers.get("Content-Type"),
+                              self.rfile.read(length).decode()))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"ok":true}')
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Stub)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        stub_host = "127.0.0.1:%d" % server.server_address[1]
+
+        def stub_env(name, **extra):
+            home = Path(tmp) / name
+            home.mkdir()
+            return dict(os.environ, VOIDZY_HOME=str(home), VOIDZY=stub_host,
+                        VOIDZY_FALLBACK="", VOIDZY_DEBOUNCE="0.4", **extra)
+
+        def fire(env, name, session, project):
+            subprocess.run([sys.executable, str(SELF), "--hook"], env=env, text=True,
+                           capture_output=True,
+                           input=json.dumps(event(name, session=session, cwd="/tmp/" + project)))
+
+        def settle(env, seconds=3.0):
+            deadline = time.time() + seconds
+            while time.time() < deadline:
+                time.sleep(0.1)
+                lock = Path(env["VOIDZY_HOME"]) / "send.lock"
+                if not lock.exists():
+                    time.sleep(0.6)
+                    if not lock.exists():
+                        return
+
+        def bodies(mark):
+            return [json.loads(p[3]) for p in posts[mark:]]
+
+        mark = len(posts)
+        env = stub_env("finish-while-busy")
+        fire(env, "PreToolUse", "busy", "klangtech")
+        fire(env, "Stop", "mine", "voidzy")
+        settle(env)
+        check("BUG 1 — a session finishing while another works reaches the clock",
+              bodies(mark) == [{"state": "done", "ttl": TTL, "label": "voidzy"}])
+        check("  it was a POST to /api/notify as json",
+              posts[mark][:3] == ("POST", "/api/notify", "application/json"))
+
+        mark = len(posts)
+        env = stub_env("ignored")
+        fire(env, "Notification", "bg", "observer-sessions")
+        fire(env, "Stop", "bg", "observer-sessions")
+        settle(env)
+        check("BUG 2a — an ignored project never takes the screen", bodies(mark) == [])
+
+        mark = len(posts)
+        env = stub_env("repeat-notify")
+        fire(env, "Notification", "ask", "voidzy")
+        settle(env)
+        fire(env, "PostToolUse", "ask", "voidzy")
+        fire(env, "Notification", "ask", "voidzy")
+        settle(env)
+        check("BUG 2b — a repeating Notification alerts once, not every cycle",
+              bodies(mark) == [{"state": "waiting", "ttl": TTL, "label": "voidzy"}])
+
+        mark = len(posts)
+        env = stub_env("no-cooldown", VOIDZY_COOLDOWN="0")
+        fire(env, "Notification", "ask", "voidzy")
+        settle(env)
+        fire(env, "PostToolUse", "ask", "voidzy")
+        fire(env, "Notification", "ask", "voidzy")
+        settle(env)
+        check("  and it is the cooldown suppressing it — with none, it alerts twice",
+              len(bodies(mark)) == 2)
+
+        def turn(env, session, project, seconds):
+            fire(env, "UserPromptSubmit", session, project)
+            time.sleep(seconds)
+            fire(env, "PostToolUse", session, project)
+            fire(env, "Stop", session, project)
+            settle(env)
+
+        mark = len(posts)
+        env = stub_env("chat-turn")
+        turn(env, "chat", "klangtech", 0)
+        check("BUG 3 — a turn that only chatted never takes the screen", bodies(mark) == [])
+
+        mark = len(posts)
+        env = stub_env("real-work", VOIDZY_MIN_WORK="1")
+        turn(env, "task", "klangtech", 1.2)
+        check("  a session that really worked still reaches the clock",
+              bodies(mark) == [{"state": "done", "ttl": TTL, "label": "klangtech"}])
+
+        mark = len(posts)
+        env = stub_env("three-turns", VOIDZY_MIN_WORK="1")
+        for _ in range(3):
+            turn(env, "chat", "klangtech", 1.2)
+        check("BUG 3b — three turns in a row take the screen once, not three times",
+              len(bodies(mark)) == 1)
+
+        mark = len(posts)
+        env = stub_env("no-guards", VOIDZY_MIN_WORK="0", VOIDZY_DONE_COOLDOWN="0")
+        for _ in range(3):
+            turn(env, "chat", "klangtech", 1.2)
+        check("  and it is those two guards — without them all three land, as reported",
+              len(bodies(mark)) == 3)
+
+        mark = len(posts)
+        env = stub_env("quick-question")
+        fire(env, "UserPromptSubmit", "ask", "klangtech")
+        fire(env, "Notification", "ask", "klangtech")
+        settle(env)
+        check("  an unanswered prompt still alerts at once, however brief the work",
+              bodies(mark) == [{"state": "waiting", "ttl": TTL, "label": "klangtech"}])
+
+        mark = len(posts)
+        env = stub_env("coalesce")
+        fire(env, "Stop", "one", "voidzy")
+        fire(env, "Notification", "two", "klangtech")
+        settle(env)
+        check("two sessions transitioning together produce one folded POST",
+              bodies(mark) == [{"state": "waiting", "ttl": TTL, "label": "klangtech +1"}])
+
+        mark = len(posts)
+        env = stub_env("both-done")
+        fire(env, "Stop", "one", "voidzy")
+        fire(env, "Stop", "two", "klangtech")
+        settle(env)
+        folded = bodies(mark)
+        check("  and neither of them is left unannounced afterwards",
+              len(folded) == 1 and folded[0]["label"].endswith(" +1")
+              and pending(json.loads((Path(env["VOIDZY_HOME"]) / "state.json").read_text()),
+                          time.time()) == [])
+
+        server.shutdown()
+
+        # TEST-NET-3, so even a bug reaching the send path could not touch a real clock.
+        env = dict(os.environ, VOIDZY_HOME=tmp, VOIDZY="203.0.113.1", VOIDZY_FALLBACK="")
+        junk = ("", "not json at all", "[1,2,3]", '"a string"')
+        codes = [subprocess.run([sys.executable, str(SELF), "--hook"], input=text, text=True,
+                                env=env, capture_output=True).returncode for text in junk]
+        check("--hook exits 0 on empty, malformed and wrong-shaped payloads",
+              codes == [0] * len(junk))
+
+        # 127.0.0.1:9 refuses instantly, which is an unreachable clock without the wait.
+        offline = dict(os.environ, VOIDZY_HOME=tmp + "/offline", VOIDZY="127.0.0.1:9",
+                       VOIDZY_FALLBACK="", VOIDZY_DEBOUNCE="0")
+        payload = json.dumps(event("Stop", session="s3"))
+        started = time.time()
+        done = subprocess.run([sys.executable, str(SELF), "--hook"], input=payload, text=True,
+                              env=offline, capture_output=True)
+        hook_took = time.time() - started
+        check("--hook exits 0 with the clock offline", done.returncode == 0)
+        check("--hook returns straight away instead of waiting on the clock", hook_took < 2)
+
+        alone = Path(tmp) / "alone"
+        alone.mkdir()
+        (alone / "state.json").write_text(json.dumps(
+            {"sessions": {"s4": {"act": "done", "project": "voidzy", "at": time.time()}}}))
+        env_alone = dict(offline, VOIDZY_HOME=str(alone))
+        started = time.time()
+        pushed = subprocess.run([sys.executable, str(SELF), "--push"], env=env_alone,
+                                capture_output=True, text=True)
+        took = time.time() - started
+        check("--push to an offline clock reports failure instead of hanging",
+              pushed.returncode != 0 and took < 10
+              and "FAILED" in (alone / "log").read_text())
+        check("and it leaves the session unannounced so the next event retries",
+              json.loads((alone / "state.json").read_text())
+              ["sessions"]["s4"].get("alerted") is None)
+
+    failed = checks.count(False)
+    print("%s — %d checks, %d failed" % (
+        "selftest FAILED" if failed else "selftest ok", len(checks), failed))
+    print("the clock at %s was never contacted" % HOST)
+    return 1 if failed else 0
+
+
+USAGE = __doc__.split("\n\n", 1)[1].rstrip()
+
+
+def main(argv):
+    args = [a for a in argv[1:]]
+    dry = "--dry-run" in args
+    args = [a for a in args if a != "--dry-run"]
+    command = args[0] if args else "help"
+
+    if command == "--hook":
+        # ponytail: a hook that fails takes the user's Claude Code session with it, so
+        # every failure here — unreachable clock, corrupt state, bad payload, a bug in
+        # this file — is swallowed on purpose and logged. A missed mascot is always the
+        # better outcome. This function must not grow a path that can return non-zero.
+        try:
+            cmd_hook(dry)
+        except Exception:
+            log("hook swallowed an error:\n%s" % traceback.format_exc())
+        return 0
+
+    if command == "--push":
+        return push()
+    if command == "--install":
+        return cmd_install(dry)
+    if command == "--uninstall":
+        return cmd_uninstall(dry)
+    if command == "--status":
+        return cmd_status()
+    if command == "--send-now":
+        return cmd_send_now(dry)
+    if command == "selftest":
+        return cmd_selftest()
+    if command in ("help", "-h", "--help"):
+        print(USAGE)
+        return 0
+    print("voidzy-claude: unknown command: %s\n" % command, file=sys.stderr)
+    print(USAGE, file=sys.stderr)
+    return 64
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
